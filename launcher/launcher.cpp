@@ -196,22 +196,130 @@ void remember_selection() {
                                                        << "\"}\n";
 }
 
-// Python runs the build tools: the Windows launcher (py -3) if present, else python on the PATH
-std::wstring g_python;
-bool g_has_python = false, g_has_clang = false;
+// --- what rebuilding the game needs on this PC ---------------------------------------------------------------------
+
+// Python runs the build scripts, LLVM compiles the game, and the Build Tools bring the Windows libraries it links
+// against. Missing ones can be installed with winget (Windows' package manager), one after another.
+struct Tool {
+    const char* name;
+    const char* why;
+    const char* size;
+    const wchar_t* winget;  // winget's arguments
+    const char* url;        // the download page, for PCs without winget
+    bool present = false;
+    enum class State { Idle, Queued, Installing, Done, Failed } state = State::Idle;
+};
+Tool g_tools[] = {
+    {"Python 3", "Runs Zonaite's build scripts.", "about 30 MB",
+     L"install -e --id Python.Python.3.12 --accept-source-agreements --accept-package-agreements "
+     L"--override \"/quiet InstallAllUsers=0 PrependPath=1 Include_launcher=1\"",
+     "https://www.python.org/downloads/windows/"},
+    {"LLVM", "Compiles the game for this PC.", "about 600 MB",
+     L"install -e --id LLVM.LLVM --accept-source-agreements --accept-package-agreements --silent",
+     "https://github.com/llvm/llvm-project/releases"},
+    {"Visual Studio Build Tools", "Windows' C++ libraries, which the game is linked with.", "about 3 GB",
+     L"install -e --id Microsoft.VisualStudio.2022.BuildTools --accept-source-agreements --accept-package-agreements "
+     L"--override \"--passive --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended\"",
+     "https://visualstudio.microsoft.com/visual-cpp-build-tools/"},
+};
+std::wstring g_python;  // the command that runs Python ("py -3" or python.exe), empty if none
+std::wstring g_winget;  // winget.exe, empty if this PC has none
+
+// PATH as a newly started program sees it: an install adds to it, but this process still has the old one
+void refresh_path() {
+    std::wstring path;
+    const std::pair<HKEY, const wchar_t*> keys[] = {
+        {HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment"},
+        {HKEY_CURRENT_USER, L"Environment"}};
+    for (const auto& [root, key] : keys) {
+        const DWORD flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+        DWORD size = 0;
+        if (RegGetValueW(root, key, L"Path", flags, nullptr, nullptr, &size) != ERROR_SUCCESS) continue;
+        std::wstring raw(size / sizeof(wchar_t) + 1, L'\0');
+        if (RegGetValueW(root, key, L"Path", flags, nullptr, raw.data(), &size) != ERROR_SUCCESS) continue;
+        raw.resize(wcslen(raw.c_str()));
+        std::wstring expanded(32768, L'\0');
+        expanded.resize(ExpandEnvironmentStringsW(raw.c_str(), expanded.data(), 32768));
+        if (!expanded.empty() && expanded.back() == L'\0') expanded.pop_back();
+        if (!path.empty()) path += L';';
+        path += expanded;
+    }
+    if (!path.empty()) SetEnvironmentVariableW(L"PATH", path.c_str());
+}
+
+// Runs a program to its end and returns what it printed
+std::string run_capture(std::wstring command) {
+    SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
+    HANDLE read = nullptr, write = nullptr;
+    if (!CreatePipe(&read, &write, &sa, 0)) return {};
+    SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW si{sizeof si};
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = si.hStdError = write;
+    PROCESS_INFORMATION pi{};
+    const BOOL ok = CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr,
+                                   nullptr, &si, &pi);
+    CloseHandle(write);
+    std::string out;
+    if (ok) {
+        char buf[4096];
+        DWORD n;
+        while (ReadFile(read, buf, sizeof buf, &n, nullptr) && n) out.append(buf, n);
+        WaitForSingleObject(pi.hProcess, 5000);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    CloseHandle(read);
+    return out;
+}
+
+std::wstring search(const wchar_t* exe) {
+    wchar_t buf[MAX_PATH];
+    return SearchPathW(nullptr, exe, nullptr, MAX_PATH, buf, nullptr) ? std::wstring(buf) : std::wstring();
+}
+
+std::wstring expand(const wchar_t* s) {
+    wchar_t buf[MAX_PATH * 2];
+    ExpandEnvironmentStringsW(s, buf, MAX_PATH * 2);
+    return buf;
+}
+
+// The C++ build tools (vswhere finds Visual Studio's) and a Windows SDK to link against
+bool has_build_tools() {
+    const std::wstring vswhere = expand(L"%ProgramFiles(x86)%\\Microsoft Visual Studio\\Installer\\vswhere.exe");
+    if (!fs::exists(vswhere)) return false;
+    const std::string found = run_capture(L"\"" + vswhere + L"\" -latest -products * -requires "
+                                          L"Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath");
+    if (found.find_first_not_of(" \r\n") == std::string::npos) return false;
+    wchar_t kits[MAX_PATH] = {};
+    DWORD size = sizeof kits;
+    return RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows Kits\\Installed Roots", L"KitsRoot10",
+                        RRF_RT_REG_SZ, nullptr, kits, &size) == ERROR_SUCCESS &&
+           fs::exists(fs::path(kits) / "Lib");
+}
 
 void find_tools() {
-    wchar_t buf[MAX_PATH];
-    if (SearchPathW(nullptr, L"py.exe", nullptr, MAX_PATH, buf, nullptr)) {
-        g_python = std::wstring(L"\"") + buf + L"\" -3";
-        g_has_python = true;
-    } else if (SearchPathW(nullptr, L"python.exe", nullptr, MAX_PATH, buf, nullptr) &&
-               !wcsstr(buf, L"WindowsApps")) {  // (the Store's placeholder only opens the Store)
-        g_python = std::wstring(L"\"") + buf + L"\"";
-        g_has_python = true;
+    refresh_path();
+    g_python.clear();
+    if (const auto py = search(L"py.exe"); !py.empty()) {
+        g_python = L"\"" + py + L"\" -3";
+    } else if (const auto python = search(L"python.exe");
+               !python.empty() && python.find(L"WindowsApps") == std::wstring::npos) {  // (the Store's stub)
+        g_python = L"\"" + python + L"\"";
+    } else {  // a per-user install that isn't on PATH yet
+        std::error_code ec;
+        for (const auto& e : fs::directory_iterator(expand(L"%LOCALAPPDATA%\\Programs\\Python"), ec))
+            if (fs::exists(e.path() / "python.exe")) g_python = L"\"" + (e.path() / "python.exe").wstring() + L"\"";
     }
-    g_has_clang = SearchPathW(nullptr, L"clang++.exe", nullptr, MAX_PATH, buf, nullptr) ||
-                  fs::exists(L"C:\\Program Files\\LLVM\\bin\\clang++.exe");
+    g_tools[0].present = !g_python.empty();
+    g_tools[1].present = !search(L"clang++.exe").empty() ||
+                         fs::exists(expand(L"%ProgramFiles%\\LLVM\\bin\\clang++.exe"));
+    g_tools[2].present = has_build_tools();
+    g_winget = search(L"winget.exe");
+}
+
+bool tools_ready() {
+    return std::all_of(std::begin(g_tools), std::end(g_tools), [](const Tool& t) { return t.present; });
 }
 
 std::wstring widen(const std::string& s) {
@@ -315,10 +423,11 @@ std::wstring play_command(const std::wstring& args) {
 
 // --- screens -------------------------------------------------------------------------------------------------------
 
-enum class Screen { Welcome, Guide, Library, Preparing };
+enum class Screen { Welcome, Guide, Library, Preparing, Tools };
 Screen g_screen = Screen::Welcome;
 Job g_job;
-enum class JobKind { None, AddDump, Prepare };
+enum class JobKind { None, AddDump, Prepare, Install };
+void open_tools(Screen back);  // the tools screen (below)
 JobKind g_job_kind = JobKind::None;
 std::string g_notice;        // the last dump check's result, or an error
 ImU32 g_notice_colour = kMuted;
@@ -502,12 +611,11 @@ void screen_welcome() {
     // what is needed on this PC, at the bottom
     ImGui::SetCursorScreenPos({f.left, f.size.y - S(110)});
     ImGui::PushTextWrapPos(f.left + f.width);
-    if (!g_has_python || !g_has_clang) {
-        std::string need = "This PC still needs ";
-        need += !g_has_python && !g_has_clang ? "Python 3 and LLVM (clang)" : !g_has_python ? "Python 3" : "LLVM (clang)";
-        need += " to rebuild the game: install them (python.org, and llvm.org's Windows installer, with \"Add to "
-                "PATH\" ticked), then start Zonaite again.";
-        para(need.c_str(), kAmber, g_small);
+    if (!tools_ready()) {
+        para("This PC is missing some free tools Zonaite needs to build the game. Zonaite can install them.", kAmber,
+             g_small);
+        ImGui::Dummy({0, S(6)});
+        if (button("Set them up")) open_tools(Screen::Welcome);
     } else {
         para("Your dump stays on this PC. Nothing from the game is ever uploaded or shared.", kFaint, g_small);
     }
@@ -652,13 +760,17 @@ void screen_library() {
                      "After that it starts at once.",
                      kMuted, g_small);
             ImGui::Dummy({0, S(16)});
-            const bool can = g_has_python && g_has_clang && !g_job.running;
-            if (button("Play", true, S(200), can)) start_prepare();
+            if (button("Play", true, S(200), !g_job.running)) {
+                if (tools_ready() || v.built)
+                    start_prepare();
+                else
+                    open_tools(Screen::Library);  // the tools to build it first
+            }
             ImGui::SameLine(0, S(14));
             if (button("Use another dump", false, 0, !g_job.running)) add_dump();
-            if (!g_has_python || !g_has_clang)
-                para("Python 3 and LLVM (clang) are needed to rebuild the game: install them, then start Zonaite "
-                     "again.", kAmber, g_small);
+            if (!tools_ready() && !v.built)
+                para("Building the game needs a few free tools this PC doesn't have yet. Play installs them first.",
+                     kAmber, g_small);
         }
         ImGui::Dummy({0, S(14)});
         if (!g_notice.empty()) para(g_notice.c_str(), g_notice_colour, g_small);
@@ -745,6 +857,120 @@ void screen_preparing() {
     end_screen();
 }
 
+// --- the tools screen: what's missing, and installing it ------------------------------------------------------------
+
+Screen g_tools_return = Screen::Welcome;  // where Back and Continue go
+
+void start_next_install() {
+    for (auto& t : g_tools) {
+        if (t.state != Tool::State::Queued) continue;
+        t.state = Tool::State::Installing;
+        g_job_kind = JobKind::Install;
+        g_job.start(L"\"" + g_winget + L"\" " + t.winget);
+        return;
+    }
+}
+
+void install_missing() {
+    for (auto& t : g_tools)
+        if (!t.present) t.state = Tool::State::Queued;
+    start_next_install();
+}
+
+// An install ended: whether the tool is there now decides, not winget's exit code (some need a restart to show)
+void finish_install() {
+    find_tools();
+    for (auto& t : g_tools)
+        if (t.state == Tool::State::Installing) t.state = t.present ? Tool::State::Done : Tool::State::Failed;
+    start_next_install();
+}
+
+void open_tools(Screen back) {
+    g_tools_return = back;
+    find_tools();
+    g_screen = Screen::Tools;
+}
+
+void screen_tools() {
+    const Frame f = begin_screen();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    text(dl, g_title, {f.left - S(3), f.top + S(22)}, kInk, "A few tools first");
+    const float col = std::min(f.width, S(860));
+    ImGui::SetCursorScreenPos({f.left, f.top + S(110)});
+    ImGui::BeginGroup();
+    ImGui::PushTextWrapPos(f.left + col);
+    para("Zonaite builds the game on your PC the first time you play, and that takes three free tools. Zonaite can "
+         "install the ones this PC is missing. Windows will ask for permission for some of them.");
+    ImGui::Dummy({0, S(20)});
+    const bool installing = g_job.running && g_job_kind == JobKind::Install;
+    for (auto& t : g_tools) {
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const float h = S(70);
+        dl->AddRectFilled(p, {p.x + col, p.y + h}, IM_COL32(255, 255, 255, 6), S(8));
+        text(dl, g_bold, {p.x + S(20), p.y + S(14)}, kInk, t.name);
+        std::string detail = std::string(t.why) + "  " + t.size;
+        text(dl, g_small, {p.x + S(20), p.y + S(38)}, kMuted, detail.c_str());
+        const char* status = "Missing";
+        ImU32 colour = kAmber;
+        if (t.present) {
+            status = "Installed";
+            colour = kAccent;
+        } else if (t.state == Tool::State::Queued) {
+            status = "Waiting";
+            colour = kMuted;
+        } else if (t.state == Tool::State::Installing) {
+            status = "Installing...";
+            colour = kInk;
+        } else if (t.state == Tool::State::Failed) {
+            status = "Not installed yet";
+            colour = kRed;
+        }
+        const ImVec2 ss = g_bold->CalcTextSizeA(g_bold->FontSize, FLT_MAX, 0, status);
+        float right = p.x + col - S(20);
+        if (!t.present && g_winget.empty()) {  // no winget: the download page instead
+            ImGui::SetCursorScreenPos({right - S(130), p.y + S(12)});
+            ImGui::PushID(t.name);
+            if (button("Download", false, S(130)))
+                ShellExecuteW(nullptr, L"open", widen(t.url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            ImGui::PopID();
+            right -= S(150);
+        }
+        text(dl, g_bold, {right - ss.x, p.y + (h - ss.y) * 0.5f}, colour, status);
+        ImGui::SetCursorScreenPos({p.x, p.y + h + S(10)});
+    }
+    ImGui::Dummy({0, S(12)});
+    if (tools_ready()) {
+        if (button("Continue", true, S(200))) g_screen = g_tools_return;
+    } else if (!g_winget.empty()) {
+        if (button(installing ? "Installing..." : "Install what's missing", true, 0, !g_job.running)) install_missing();
+    }
+    ImGui::SameLine(0, S(14));
+    if (button("Check again", false, 0, !g_job.running)) find_tools();
+    ImGui::SameLine(0, S(14));
+    if (button("Back", false, 0, !installing)) g_screen = g_tools_return;
+    ImGui::Dummy({0, S(14)});
+    if (g_winget.empty())
+        para("This PC doesn't have winget, so the tools have to be installed by hand: download each one, install it, "
+             "then press Check again. For Python, tick \"Add python.exe to PATH\"; for the Build Tools, choose "
+             "\"Desktop development with C++\".",
+             kMuted, g_small);
+    else
+        para("Installing accepts each tool's licence. The Build Tools are the biggest download and can take 10 "
+             "minutes or more. If a tool still shows as missing afterwards, restart the PC and open Zonaite again.",
+             kFaint, g_small);
+    if (installing) {  // the installer's last words
+        const auto lines = g_job.snapshot();
+        for (size_t i = lines.size() > 3 ? lines.size() - 3 : 0; i < lines.size(); ++i) {
+            std::string l = lines[i];
+            l.erase(0, l.find_first_not_of(" -\\|/"));
+            if (!l.empty()) para(l.c_str(), kFaint, g_small);
+        }
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::EndGroup();
+    end_screen();
+}
+
 void load_fonts() {
     ImGuiIO& io = ImGui::GetIO();
     const float scale = g_s;
@@ -793,6 +1019,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         if (was_running && !g_job.running) {
             if (g_job_kind == JobKind::AddDump) {
                 finish_add_dump();
+            } else if (g_job_kind == JobKind::Install) {
+                finish_install();  // (it may start the next install)
             } else if (g_job_kind == JobKind::Prepare) {
                 load_versions();
                 if (g_job.exit_code == 0) {
@@ -803,7 +1031,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                     g_notice_colour = kRed;
                 }
             }
-            g_job_kind = JobKind::None;
+            if (!g_job.running) g_job_kind = JobKind::None;
         }
         was_running = g_job.running;
         // the game ended: back to the launcher (with a note if it stopped right away)
@@ -825,6 +1053,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         case Screen::Guide: screen_guide(); break;
         case Screen::Library: screen_library(); break;
         case Screen::Preparing: screen_preparing(); break;
+        case Screen::Tools: screen_tools(); break;
         }
         gfx_end();
     }

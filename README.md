@@ -25,10 +25,8 @@ No game files come with Zonaite. You bring your own copy, and it stays on your c
 - A graphics card with Vulkan support (any recent NVIDIA, AMD or Intel card)
 - Your own copy of Tears of the Kingdom, dumped from your own Switch
 - About 30 GB of free space
-- [Python 3](https://www.python.org/downloads/) and [LLVM](https://github.com/llvm/llvm-project/releases)
-  (tick "Add to PATH" when installing both), plus the
-  [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with
-  "Desktop development with C++". Zonaite uses these to rebuild the game on your PC.
+- Python, LLVM and the Visual Studio Build Tools, which Zonaite uses to rebuild the game on your PC. If any are
+  missing, the launcher offers to install them for you (about 4 GB in all).
 
 ## Getting started
 

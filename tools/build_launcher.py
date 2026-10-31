@@ -26,7 +26,7 @@ SOURCES = [os.path.join(ROOT, "launcher", "launcher.cpp"), os.path.join(ROOT, "l
                                             "backends/imgui_impl_win32.cpp", "backends/imgui_impl_vulkan.cpp")]
 FLAGS = ["-std=c++20", "-O2", "-DUNICODE", "-D_UNICODE", "-DIMGUI_IMPL_VULKAN_NO_PROTOTYPES",
          "-I", IMGUI, "-I", os.path.join(VULKAN_SDK, "Include")]
-LIBS = ["user32", "gdi32", "shell32", "ole32", "imm32", "dwmapi"]
+LIBS = ["user32", "gdi32", "shell32", "ole32", "imm32", "dwmapi", "advapi32"]
 
 
 def compile_one(src, obj):
