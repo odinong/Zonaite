@@ -1,0 +1,135 @@
+#version 460
+// Per pixel of one game frame (the source), its motion to the other frame (the destination) and its view
+// distance. The camera gives the exact motion of everything static: the pixel's depth unprojected with the
+// source camera and projected with the destination's. Things that move by themselves (Link, enemies, effects)
+// don't follow it, so the camera vector competes with the one-way optical flow around the pixel and with no
+// motion, by how well the two frames agree along each (3x3 taps of colour); the camera wins near-ties.
+// Output: (motion in UV units, view distance from the source camera, from the destination camera). The second
+// distance is the camera's change only (things that move by themselves change little in depth in one frame), so
+// the forward warp can compare surfaces from both frames at the same moment.
+// Refine mode: the other frame's motion, splatted onto this frame and reversed (zn_interp_scatter), is offered
+// as a candidate per pixel, so where the estimate for one direction found a moving limb and the other did not,
+// both end up with it.
+#extension GL_GOOGLE_include_directive : require
+#include "zn_interp_depth.glsl"
+
+layout(push_constant) uniform Motion {
+    layout(row_major) mat4 reproj;  // source clip-space position (ndc, 1) -> destination clip space
+    vec4 src_vp;    // the source viewport in its depth surface: origin (xy) and size (zw), texels
+    vec4 src_z;     // sign of the source viewport's x and y scale; depth = z * ndc_z + w
+    vec4 src_proj;  // source projection: p22, p23 (view z = p23 / (-ndc_z - p22)); z = 1 when the camera is known
+    vec4 dst_sign;  // sign of the destination viewport's x and y scale
+    vec2 out_size;  // the motion map's size
+    int refine;     // 1: refine this map with the other frame's reversed motion
+    float pad;
+    vec4 content;   // the game's picture in the frame (x, y, width, height as fractions)
+} p;
+
+layout(binding = 0) uniform sampler2D src_color;  // scene images, display-encoded
+layout(binding = 1) uniform sampler2D dst_color;
+layout(binding = 2) uniform sampler2D src_depth;  // the source frame's depth buffer
+layout(binding = 3) uniform sampler2D src_flow;   // one-way flow source -> destination, 1/2 size
+layout(binding = 6, rgba32f) uniform image2D motion;
+layout(binding = 7, r32ui) uniform readonly uimage2D splat_nearest;  // refine: the other frame's splat
+layout(binding = 8, rgba32f) uniform readonly image2D splat_motion;
+// per pixel: its motion if it were static (the camera's), and 1 in z when it moves by itself (clean mode moves
+// every pixel by the camera only, and takes things that move by themselves from the nearer frame alone)
+layout(binding = 9, rgba32f) uniform writeonly image2D camera;
+
+vec2 texel;
+
+float disagreement(vec2 uv, vec2 v) {
+    float c = 0.0;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            const vec2 q = uv + vec2(dx, dy) * 2.0 * texel;
+            const vec3 d = texture(src_color, q).rgb - texture(dst_color, q + v).rgb;
+            c += abs(d.r) + abs(d.g) + abs(d.b);
+        }
+    return c / 27.0;
+}
+
+void main() {
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(xy, ivec2(p.out_size)))) return;
+    texel = 1.0 / p.out_size;
+    const vec2 uv = (vec2(xy) + 0.5) * texel;
+    if (p.refine == 1) {
+        const vec4 own = imageLoad(motion, xy);
+        vec2 best = own.xy;
+        float best_cost = disagreement(uv, own.xy);
+        const float keep = best_cost - 0.003;  // replace only for a clear improvement
+        float found = keep;
+        const ivec2 offsets[5] = {ivec2(0), ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1)};
+        for (int i = 0; i < 5; i++) {
+            const ivec2 q = clamp(xy + offsets[i], ivec2(0), ivec2(p.out_size) - 1);
+            if (imageLoad(splat_nearest, q).r == kNoDepth) continue;
+            const vec2 v = imageLoad(splat_motion, q).xy;
+            const float cost = disagreement(uv, v);
+            if (cost < found) {
+                found = cost;
+                best = v;
+                best_cost = cost;
+            }
+        }
+        imageStore(motion, xy, vec4(best, own.zw));
+        return;
+    }
+
+    // the black bars around the picture (a window of another shape) stay where they are
+    const vec2 cuv = (uv - p.content.xy) / p.content.zw;
+    if (any(lessThan(cuv, vec2(0.0))) || any(greaterThan(cuv, vec2(1.0)))) {
+        imageStore(motion, xy, vec4(0.0, 0.0, 1e7, 1e7));
+        imageStore(camera, xy, vec4(0.0, 0.0, 0.0, 0.0));
+        return;
+    }
+    const ivec2 dsize = textureSize(src_depth, 0);
+    const ivec2 dpos = clamp(ivec2(p.src_vp.xy + cuv * p.src_vp.zw), ivec2(0), dsize - 1);
+    const float d = texelFetch(src_depth, dpos, 0).r;
+    const vec3 ndc = vec3((2.0 * cuv - 1.0) * p.src_z.xy, (d - p.src_z.w) / p.src_z.z);
+    const float denom = -ndc.z - p.src_proj.x;
+    const float distance = abs(denom) < 1e-7 ? 1e7 : clamp(-p.src_proj.y / denom, 0.0, 1e7);
+
+    vec2 best = vec2(0.0);
+    float best_cost = disagreement(uv, best) - 0.002;  // no motion: a small bonus
+    float dst_distance = distance;
+    vec2 cam_v = vec2(0.0);
+    bool cam_ok = false;
+    if (p.src_proj.z > 0.5) {
+        const vec4 c = p.reproj * vec4(ndc, 1.0);
+        if (c.w > 1e-6) dst_distance = min(c.w, 1e7);  // clip w = view distance (w = -z)
+        if (c.w > 1e-6) {
+            const vec2 cam = (((c.xy / c.w) * p.dst_sign.xy + 1.0) * 0.5 - cuv) * p.content.zw;
+            cam_v = cam;
+            cam_ok = true;
+            const float cost = disagreement(uv, cam) - 0.006;  // the exact motion of static things
+            if (cost < best_cost) {
+                best_cost = cost;
+                best = cam;
+            }
+        }
+    }
+    const vec2 ft = 1.0 / vec2(textureSize(src_flow, 0));
+    const vec2 base = (floor(uv / ft - 0.5) + 0.5) * ft;
+    {
+        const vec2 v = texture(src_flow, uv).xy;
+        const float cost = disagreement(uv, v);
+        if (cost < best_cost) {
+            best_cost = cost;
+            best = v;
+        }
+    }
+    for (int dy = 0; dy <= 1; dy++)
+        for (int dx = 0; dx <= 1; dx++) {
+            const vec2 v = texture(src_flow, base + vec2(dx, dy) * ft).xy;
+            const float cost = disagreement(uv, v);
+            if (cost < best_cost) {
+                best_cost = cost;
+                best = v;
+            }
+        }
+    imageStore(motion, xy, vec4(best, distance, dst_distance));
+    // moving by itself: the best match is not the camera's motion (beyond half a pixel)
+    const bool moving = !cam_ok || length((best - cam_v) * p.out_size) > 0.75;
+    imageStore(camera, xy, vec4(cam_v, moving ? 1.0 : 0.0, 0.0));
+}

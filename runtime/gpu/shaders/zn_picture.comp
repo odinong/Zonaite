@@ -1,0 +1,41 @@
+#version 460
+// Picture adjustments (runtime/gpu/picture.cpp): sharpening, then gamma, contrast, brightness and saturation, on
+// a copy of a frame about to be shown, written back into the frame. Display-encoded values, like a monitor's own
+// picture settings.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1) uniform writeonly image2D dst;
+
+layout(push_constant) uniform Params {
+    vec4 tone;   // brightness (added), contrast, saturation, gamma
+    vec4 frame;  // sharpening 0..1, width, height, unused
+} p;
+
+vec3 at(ivec2 q) {
+    return texelFetch(src, clamp(q, ivec2(0), ivec2(p.frame.yz) - 1), 0).rgb;
+}
+
+void main() {
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (xy.x >= int(p.frame.y) || xy.y >= int(p.frame.z)) {
+        return;
+    }
+    vec3 c = at(xy);
+    if (p.frame.x > 0.0) {
+        // contrast adaptive sharpening: strongest where the neighbourhood is flat, weak on edges that are
+        // already hard, so it sharpens texture without ringing
+        const vec3 n = at(xy + ivec2(0, -1)), s = at(xy + ivec2(0, 1));
+        const vec3 w = at(xy + ivec2(-1, 0)), e = at(xy + ivec2(1, 0));
+        const vec3 lo = min(c, min(min(n, s), min(w, e)));
+        const vec3 hi = max(c, max(max(n, s), max(w, e)));
+        const vec3 amp = sqrt(clamp(min(lo, 1.0 - hi) / max(hi, vec3(1e-4)), 0.0, 1.0));
+        const vec3 weight = amp * (-1.0 / mix(8.0, 4.5, p.frame.x));
+        c = clamp((c + (n + s + w + e) * weight) / (1.0 + 4.0 * weight), 0.0, 1.0);
+    }
+    c = pow(max(c, vec3(0.0)), vec3(1.0 / p.tone.w));
+    c = (c - 0.5) * p.tone.y + 0.5 + p.tone.x;
+    const float luma = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    c = mix(vec3(luma), c, p.tone.z);
+    imageStore(dst, xy, vec4(clamp(c, 0.0, 1.0), 1.0));
+}

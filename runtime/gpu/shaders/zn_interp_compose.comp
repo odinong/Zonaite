@@ -1,0 +1,129 @@
+#version 460
+// The in-between frame at time t, second step: colour each pixel with the surface the choose pass picked
+// (zn_interp_choose). A pixel whose surface moves unlike almost all of its 3x3 neighbourhood (a stray pick at the
+// outline of a fast-moving character) takes the surface most of its neighbours agree on instead, which removes
+// the speckle such picks leave. Where most surfaces around a pixel are unconfirmed (motion too large or too
+// deforming to estimate, such as a character swinging round in a close-up), the pixel shows the nearer game
+// frame outright (never a blend of the two, which would ghost): that area updates at the game's rate instead of
+// smearing. When too much of the frame is unconfirmed, all of it does.
+// The scene part comes from the HUD-free scene images. The HUD is then put back from the presented frames: where
+// a presented frame differs from its scene image, it is the scene under a HUD layer of opacity a,
+// presented = (1 - a) scene + a hud, and (1 - a) follows from how much the presented pixel changed with the
+// scene. A HUD element that stays put is laid over the moving scene exactly; one that moves or changes is shown
+// as in the nearer game frame (moving HUD then steps at the game's rate, as in other frame generation).
+#extension GL_GOOGLE_include_directive : require
+#include "zn_interp_surface.glsl"
+
+layout(binding = 2) uniform sampler2D shown_prev;  // the presented frames, display-encoded
+layout(binding = 3) uniform sampler2D shown_cur;
+layout(binding = 10) uniform writeonly image2D dst;
+layout(binding = 11, rgba32f) uniform readonly image2D choice;
+layout(binding = 12, r32ui) uniform readonly uimage2D unconfirmed_total;
+
+int Base(vec4 ch) {
+    return int(ch.w) & 3;
+}
+
+bool Solo(vec4 ch) {
+    return (int(ch.w) & 16) != 0;
+}
+
+// The picked surface's motion as current -> previous, in pixels (for comparing neighbours' picks)
+vec2 Norm(vec4 ch) {
+    return (Base(ch) == 2 ? -ch.xy : ch.xy) * p.out_size;
+}
+
+void main() {
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(xy, ivec2(p.out_size)))) return;
+    const vec2 uv = (vec2(xy) + 0.5) / p.out_size;
+    // the bars around the picture: as the frames show them
+    const vec2 cuv = (uv - p.content.xy) / p.content.zw;
+    if (any(lessThan(cuv, vec2(0.0))) || any(greaterThan(cuv, vec2(1.0)))) {
+        imageStore(dst, xy, vec4(texture(shown_cur, uv).rgb, 1.0));
+        return;
+    }
+
+    // the share of unconfirmed picks over 9x9 px (every other pixel)
+    float unconfirmed = 0.0;
+    for (int dy = -4; dy <= 4; dy += 2)
+        for (int dx = -4; dx <= 4; dx += 2)
+            unconfirmed += imageLoad(choice, clamp(xy + ivec2(dx, dy), ivec2(0), ivec2(p.out_size) - 1)).w >= 8.0
+                               ? 1.0 : 0.0;
+    unconfirmed /= 25.0;
+
+    vec4 picks[9];
+    for (int i = 0; i < 9; i++)
+        picks[i] = imageLoad(choice, clamp(xy + ivec2(i % 3 - 1, i / 3 - 1), ivec2(0), ivec2(p.out_size) - 1));
+    vec4 ch = picks[4];
+    int support[9];
+    for (int i = 0; i < 9; i++) {
+        support[i] = 0;
+        if (Base(picks[i]) == 0) continue;
+        for (int j = 0; j < 9; j++)
+            if (Base(picks[j]) != 0 && distance(Norm(picks[i]), Norm(picks[j])) < 1.0) support[i]++;
+    }
+    if (Base(ch) != 0 && support[4] <= 2) {
+        int best = 4;
+        for (int i = 0; i < 9; i++)
+            if (support[i] > support[best]) best = i;
+        if (support[best] >= 5) ch = picks[best];
+    }
+
+    Surface s;
+    s.ok = true;
+    s.v = ch.xy;
+    s.distance = ch.z;
+    s.solo = Solo(ch);
+    const int base = Base(ch);
+    vec3 scene;
+    if (base == 0) {
+        scene = p.t >= 0.5 ? texture(scene_cur, uv).rgb : texture(scene_prev, uv).rgb;  // no crossfade
+    } else if (base == 3) {
+        s.from = 0;
+        const vec4 at = Sources(s, uv);
+        scene = mix(sharp(scene_prev, at.xy), sharp(scene_cur, at.zw), p.t);
+    } else {
+        s.from = base - 1;
+        scene = One(s, uv);
+    }
+    const vec3 nearer = p.t >= 0.5 ? texture(scene_cur, uv).rgb : texture(scene_prev, uv).rgb;
+    const float total = float(imageLoad(unconfirmed_total, ivec2(0)).r);
+    const bool whole = total > 0.15 * p.out_size.x * p.out_size.y;
+    if (whole || unconfirmed > 0.4) scene = nearer;
+
+    // the HUD layer, from the presented frames at this pixel (its blending is in linear colour)
+    const vec3 shown_pe = texture(shown_prev, uv).rgb, shown_ce = texture(shown_cur, uv).rgb;
+    const vec3 sp_e = texture(scene_prev, uv).rgb, sc_e = texture(scene_cur, uv).rgb;
+    const vec3 dp = abs(shown_pe - sp_e), dc = abs(shown_ce - sc_e);
+    const bool hud_p = max(dp.r, max(dp.g, dp.b)) > 1.5 / 255.0, hud_c = max(dc.r, max(dc.g, dc.b)) > 1.5 / 255.0;
+    vec3 colour = scene;  // encoded until the HUD needs linear colour
+    bool linear = false;
+    const bool near_c = p.t >= 0.5;
+    if (hud_p && hud_c) {
+        linear = true;
+        const vec3 shown_p = decode_srgb(shown_pe), shown_c = decode_srgb(shown_ce);
+        const vec3 sp = decode_srgb(sp_e), sc = decode_srgb(sc_e);
+        scene = decode_srgb(scene);
+        const vec3 ds = sc - sp, df = shown_c - shown_p;
+        const float dd = dot(ds, ds);
+        const float k = dd < 1e-5 ? 1.0 : clamp(dot(df, ds) / dd, 0.0, 1.0);  // 1 - HUD opacity
+        const vec3 left = df - k * ds;  // what the HUD itself changed
+        if (dd < 1e-5) {
+            // the scene here did not change: blend only if the HUD did not either (a blend of two different HUD
+            // pictures would ghost)
+            colour = max(abs(df.r), max(abs(df.g), abs(df.b))) < 0.02 ? mix(shown_p, shown_c, p.t)
+                                                                     : (near_c ? shown_c : shown_p);
+        } else if (max(abs(left.r), max(abs(left.g), abs(left.b))) < 0.02) {
+            colour = k * scene + mix(shown_p - k * sp, shown_c - k * sc, p.t);  // a HUD element that stays put
+        } else {
+            colour = near_c ? shown_c : shown_p;
+        }
+    } else if (hud_p || hud_c) {
+        // a HUD element that moved or appeared: as the nearer game frame shows it
+        if (near_c ? hud_c : hud_p) colour = near_c ? shown_ce : shown_pe;
+    }
+    if (linear) colour = encode_srgb(clamp(colour, 0.0, 1.0));
+
+    imageStore(dst, xy, vec4(clamp(colour, 0.0, 1.0), 1.0));
+}

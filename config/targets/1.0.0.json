@@ -1,0 +1,17 @@
+{
+  "title": "The Legend of Zelda: Tears of the Kingdom",
+  "program_id": "0100F2C0115B6000",
+  "version": "1.0.0",
+  "label": "Original release",
+  "verified": false,
+  "romfs_version_marker": {
+    "file": "System/RegionLangMask.txt",
+    "version_line": "100",
+    "build_id_line": "082ce09b06e33a123cb1e2770f5f9147709033db"
+  },
+  "exefs": {
+    "main": {
+      "build_id": "082CE09B06E33A123CB1E2770F5F9147709033DB"
+    }
+  }
+}

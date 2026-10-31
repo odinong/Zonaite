@@ -1,0 +1,68 @@
+#version 460
+// Motion estimation at one pyramid level, coarse to fine. Bilateral (mode 0): for each texel x of the in-between
+// frame, the vector v (in UV units) for which prev(x - v/2) matches cur(x + v/2) over a 5x5 patch, the motion
+// through x itself. One-way (mode 1): for each texel x of the first frame bound, the v for which first(x) matches
+// second(x + v). Candidates: the coarser level's estimates around x, and zero; the best is refined by a local
+// search. Output: (v, cost, 0).
+#extension GL_GOOGLE_include_directive : require
+#include "zn_interp_common.glsl"
+layout(binding = 0) uniform sampler2D prev_luma;
+layout(binding = 1) uniform sampler2D cur_luma;
+layout(binding = 2) uniform sampler2D coarse;
+layout(binding = 3, rgba16f) uniform writeonly image2D flow;
+
+vec2 texel;
+
+// over a 5x5 patch; 3x3 at the finest level (half size), which only refines what the coarser levels found
+float match(vec2 uv, vec2 v) {
+    float c = 0.0;
+    const int r = p.top == 2 ? 1 : 2;
+    for (int dy = -r; dy <= r; dy++)
+        for (int dx = -r; dx <= r; dx++) {
+            const vec2 q = uv + vec2(dx, dy) * texel;
+            c += p.mode == 1 ? abs(texture(prev_luma, q).r - texture(cur_luma, q + v).r)
+                             : abs(texture(prev_luma, q - 0.5 * v).r - texture(cur_luma, q + 0.5 * v).r);
+        }
+    return c / float((2 * r + 1) * (2 * r + 1));
+}
+
+void main() {
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (outside(xy)) return;
+    texel = 1.0 / p.dst_size;
+    const vec2 uv = (vec2(xy) + 0.5) * texel;
+
+    vec2 predicted = vec2(0.0);
+    vec2 best = vec2(0.0);
+    float best_cost = match(uv, best);
+    if (p.top != 1) {
+        const vec2 ct = 1.0 / vec2(textureSize(coarse, 0));
+        predicted = texture(coarse, uv).xy;
+        // the coarser estimate here and over a 5x5 neighbourhood (every other texel): an object moving unlike its
+        // surroundings keeps its own vector from a neighbouring coarse texel. At the finest level (top 2), 3x3.
+        const int reach = p.top == 2 ? 1 : 2;
+        for (int dy = -reach; dy <= reach; dy += 1)
+            for (int dx = -reach; dx <= reach; dx += 1) {
+                if (reach == 2 && (dx & 1) != 0 && (dy & 1) != 0) continue;  // 21 of the 25
+                const vec2 cand = texture(coarse, uv + vec2(dx, dy) * ct).xy;
+                const float c = match(uv, cand) + p.lambda * length((cand - predicted) * p.dst_size);
+                if (c < best_cost) {
+                    best_cost = c;
+                    best = cand;
+                }
+            }
+    }
+    // local search around the best candidate (the whole range at the top level)
+    const vec2 centre = best;
+    for (int dy = -p.radius; dy <= p.radius; dy++)
+        for (int dx = -p.radius; dx <= p.radius; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            const vec2 v = centre + vec2(dx, dy) * texel;
+            const float c = match(uv, v) + p.lambda * length((v - predicted) * p.dst_size);
+            if (c < best_cost) {
+                best_cost = c;
+                best = v;
+            }
+        }
+    imageStore(flow, xy, vec4(best, best_cost, 0.0));
+}

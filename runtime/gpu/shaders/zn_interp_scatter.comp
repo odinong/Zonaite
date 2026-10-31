@@ -1,0 +1,66 @@
+#version 460
+// Forward warp of one game frame's pixels to the in-between frame's time, nearest surface first. Each source pixel
+// moves along its motion by `step` (1 - t from the current frame, t from the previous one) and covers the pixels
+// of the generated frame within 0.75 px of where it lands, at its view distance at that moment (between its
+// distances from the two cameras, zn_interp_motion). Pass 0 keeps the nearest view distance per pixel
+// (atomic min); pass 1 stores the motion of the pixel that won. With step 1 and sign -1 it splats a frame onto
+// the other frame instead, storing the reversed motion: a motion candidate for that frame's pixels.
+// Clean mode: the in-between frame is the nearer game frame moved by the camera's motion (exact, from depth):
+// all of its pixels, tagged 2 in winner.w, win wherever they land. The other frame only fills what that leaves
+// uncovered, from its static pixels (things moving by themselves, and 2 px around them, are left out). Nothing is
+// estimated, blended between two poses, or torn. Clean mode also covers a full pixel around each landing point,
+// so a camera moving forward leaves no cracks.
+#extension GL_GOOGLE_include_directive : require
+#include "zn_interp_depth.glsl"
+
+layout(push_constant) uniform Scatter {
+    vec2 out_size;
+    float step;
+    int pass;
+    float sign;
+    int clean;     // 1: clean mode
+    float nearer;  // 1 when this frame is the one nearer to the in-between frame's time
+} p;
+
+layout(binding = 6, rgba32f) uniform readonly image2D motion;
+layout(binding = 7, r32ui) uniform uimage2D nearest;
+layout(binding = 8, rgba32f) uniform writeonly image2D winner;
+layout(binding = 9, rgba32f) uniform readonly image2D camera;  // zn_interp_motion: camera motion, moving flag
+
+void main() {
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(xy, ivec2(p.out_size)))) return;
+    vec4 m = imageLoad(motion, xy);
+    float tag = 1.0;
+    if (p.clean == 1) {
+        const vec4 cm = imageLoad(camera, xy);
+        bool moving = cm.z > 0.5;
+        if (p.nearer < 0.5) {
+            for (int dy = -2; dy <= 2 && !moving; dy++)
+                for (int dx = -2; dx <= 2 && !moving; dx++)
+                    moving = imageLoad(camera, clamp(xy + ivec2(dx, dy), ivec2(0), ivec2(p.out_size) - 1)).z > 0.5;
+            if (moving) return;  // the far frame's moving things are not used
+        } else {
+            tag = 2.0;
+        }
+        m.xy = cm.xy;
+    }
+    const vec2 uv = (vec2(xy) + 0.5) / p.out_size;
+    const vec2 pos = (uv + p.step * m.xy) * p.out_size - 0.5;  // in pixel-centre coordinates
+    const vec2 base = floor(pos);
+    const vec2 f = pos - base;
+    const float distance = mix(m.z, m.w, p.step);
+    const uint key = floatBitsToUint(distance);  // positive floats order like their bits
+    for (int oy = 0; oy <= 1; oy++)
+        for (int ox = 0; ox <= 1; ox++) {
+            const vec2 o = vec2(ox, oy);
+            if (max(abs(o.x - f.x), abs(o.y - f.y)) >= (p.clean == 1 ? 1.0 : 0.75)) continue;
+            const ivec2 q = ivec2(base + o);
+            if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, ivec2(p.out_size)))) continue;
+            if (p.pass == 0) {
+                imageAtomicMin(nearest, q, key);
+            } else if (imageLoad(nearest, q).r == key) {
+                imageStore(winner, q, vec4(p.sign * m.xy, distance, tag));
+            }
+        }
+}

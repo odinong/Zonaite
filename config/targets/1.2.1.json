@@ -1,0 +1,30 @@
+{
+  "title": "The Legend of Zelda: Tears of the Kingdom",
+  "program_id": "0100F2C0115B6000",
+  "version": "1.2.1",
+  "romfs_version_marker": {
+    "file": "System/RegionLangMask.txt",
+    "version_line": "121",
+    "build_id_line": "9b4e43650501a4d4489b4bbfdb740f26af3cf850"
+  },
+  "exefs": {
+    "main": {
+      "sha1": "2c86f7554b18e52934ac03b076161a169fd58ac0",
+      "build_id": "9B4E43650501A4D4489B4BBFDB740F26AF3CF850"
+    },
+    "rtld": {
+      "sha1": "8b14903f3fcc504f7e2d4c635222d5907d074f4d",
+      "build_id": "7501ABFE55FA41CFFEB46BD619BDCBF45B9CAE3A"
+    },
+    "sdk": {
+      "sha1": "fd105d56beaa09d509bcd9768c4fcdea43dbab1a",
+      "build_id": "B9046C31EB5D31271BE970FE732D38DF49C6AA21"
+    },
+    "subsdk0": {
+      "sha1": "793d2fc4b36d45e3e72a7dd51af1e730d9e6f7da",
+      "build_id": "A6BB7C6FFA9673769FA74ED3D7B054191F25D29C"
+    }
+  },
+  "verified": true,
+  "label": "Latest update"
+}

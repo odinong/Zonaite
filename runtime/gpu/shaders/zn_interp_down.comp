@@ -1,0 +1,12 @@
+#version 460
+// Luma pyramid: half size, one bilinear tap at the shared corner of each 2x2 block
+#extension GL_GOOGLE_include_directive : require
+#include "zn_interp_common.glsl"
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 3, r32f) uniform writeonly image2D dst;
+
+void main() {
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (outside(xy)) return;
+    imageStore(dst, xy, texture(src, (vec2(xy) + 0.5) / p.dst_size));
+}

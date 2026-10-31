@@ -1,0 +1,40 @@
+# Anything derived from the game. Never commit these.
+/generated/
+/dump/
+/exefs/
+/romfs/
+*.nso
+*.npdm
+*.nca
+*.nsp
+*.xci
+*.nsz
+*.xcz
+*.keys
+*.tik
+*.nacp
+*_game.dll
+*_game.so
+
+# Test output (memory dumps, screenshots, recordings, save copies)
+/scratch/
+/captures/
+memdump_*
+*.sav
+
+# Build output
+/build/
+/out/
+__pycache__/
+*.pyc
+
+# Local secrets (Discord webhook) and machine-specific settings
+/.local/
+
+# Upstream emulator checkout (we vendor pinned subsets from it)
+/third_party/eden-src/
+/third_party/deps/
+
+# the launcher and tools/play.py: remembered dump folders, the game log when started from the launcher
+/user/
+/zonaite.log

@@ -1,0 +1,78 @@
+#version 460
+// The in-between frame at time t: each pixel takes the best of the motion candidates around it (the bilinear flow,
+// the 4 nearest flow texels, and no motion), judged by how well the two source frames agree along it over a 3x3 grid
+// of taps, then blends prev(x - t v) and cur(x + (1 - t) v). A pixel that did not change between the frames
+// keeps no motion outright, so HUD elements and static parts stay sharp over moving scenery, and a moving pixel
+// never takes its colour from a static one (a HUD element it passes under). Where no candidate
+// makes the frames agree (occlusion, effects), it leans to the frame nearer in time.
+#extension GL_GOOGLE_include_directive : require
+#include "zn_interp_common.glsl"
+layout(binding = 0) uniform sampler2D prev_color;
+layout(binding = 1) uniform sampler2D cur_color;
+layout(binding = 2) uniform sampler2D flow;
+layout(binding = 3) uniform writeonly image2D dst;
+
+vec2 texel;
+
+bool still(vec2 q) {
+    const vec3 d = abs(texture(prev_color, q).rgb - texture(cur_color, q).rgb);
+    return d.r + d.g + d.b < 0.02;
+}
+
+float disagreement(vec2 uv, vec2 v) {
+    float c = 0.0;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            const vec2 q = uv + vec2(dx, dy) * 2.0 * texel;
+            const vec3 d = texture(prev_color, q - p.t * v).rgb - texture(cur_color, q + (1.0 - p.t) * v).rgb;
+            c += abs(d.r) + abs(d.g) + abs(d.b);
+        }
+    return c / 27.0;
+}
+
+void main() {
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (outside(xy)) return;
+    texel = 1.0 / p.dst_size;
+    const vec2 uv = (vec2(xy) + 0.5) * texel;
+
+    const vec3 here_a = texture(prev_color, uv).rgb, here_b = texture(cur_color, uv).rgb;
+    const vec3 here_d = abs(here_a - here_b);
+    if (here_d.r + here_d.g + here_d.b < 0.02) {
+        imageStore(dst, xy, vec4(mix(here_a, here_b, p.t), 1.0));
+        return;
+    }
+
+    const vec2 ft = 1.0 / vec2(textureSize(flow, 0));
+    const vec2 base = (floor(uv / ft - 0.5) + 0.5) * ft;  // the flow texel up-left of uv
+    vec2 best = texture(flow, uv).xy;
+    float best_cost = disagreement(uv, best);
+    {
+        // no motion gets a small bonus: static pixels (HUD) must never be dragged along
+        const float c = disagreement(uv, vec2(0.0)) - 0.004;
+        if (c < best_cost) {
+            best_cost = c;
+            best = vec2(0.0);
+        }
+    }
+    // the 4 flow texels around uv: edges between two motions
+    for (int dy = 0; dy <= 1; dy++)
+        for (int dx = 0; dx <= 1; dx++) {
+            const vec2 cand = texture(flow, base + vec2(dx, dy) * ft).xy;
+            const float c = disagreement(uv, cand);
+            if (c < best_cost) {
+                best_cost = c;
+                best = cand;
+            }
+        }
+    const vec3 a = texture(prev_color, uv - p.t * best).rgb;
+    const vec3 b = texture(cur_color, uv + (1.0 - p.t) * best).rgb;
+    vec3 colour = mix(a, b, p.t);
+    if (dot(best * p.dst_size, best * p.dst_size) > 0.25) {
+        const bool still_a = still(uv - p.t * best), still_b = still(uv + (1.0 - p.t) * best);
+        if (still_a != still_b) colour = still_a ? b : a;
+    }
+    const vec3 nearer = p.t < 0.5 ? a : b;
+    colour = mix(colour, nearer, smoothstep(0.08, 0.25, best_cost));
+    imageStore(dst, xy, vec4(colour, 1.0));
+}

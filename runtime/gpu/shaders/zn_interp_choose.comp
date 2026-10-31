@@ -1,0 +1,124 @@
+#version 460
+// The in-between frame at time t, first step: per pixel, which surface it shows, from the two forward warps
+// (zn_interp_scatter): the surface that landed here from the current frame and the one from the previous frame.
+// A surface is consistent when both frames show it along its motion (their colours agree there).
+// - Both landed: if both frames moved the same surface the same way, it is that surface from both frames.
+//   Otherwise a consistent one beats an inconsistent one (a wrongly moved copy of a limb is inconsistent: it
+//   would leave a ghost); between equals, the nearer one, and at the same distance it is one surface.
+// - One landed: that surface.
+// - Neither (uncovered background): the farthest surface that landed within 4 px, moved here along its motion.
+// Output (zn_interp_surface.glsl): motion, distance, code (kNone / kOne + frame / kBoth, +4 when filled, +8 when
+// the two frames don't confirm the surface: the motion there is a guess).
+#extension GL_GOOGLE_include_directive : require
+#include "zn_interp_surface.glsl"
+
+layout(binding = 6, r32ui) uniform readonly uimage2D nearest_from_cur;
+layout(binding = 7, r32ui) uniform readonly uimage2D nearest_from_prev;
+layout(binding = 8, rgba32f) uniform readonly image2D winner_from_cur;
+layout(binding = 9, rgba32f) uniform readonly image2D winner_from_prev;
+layout(binding = 11, rgba32f) uniform writeonly image2D choice;
+layout(binding = 12, r32ui) uniform uimage2D unconfirmed_total;  // pixels whose surface the frames don't confirm
+
+shared uint group_unconfirmed;
+bool g_unconfirmed = false;
+
+Surface Load(ivec2 q, int from) {
+    Surface s;
+    s.from = from;
+    s.ok = (from == 0 ? imageLoad(nearest_from_cur, q).r : imageLoad(nearest_from_prev, q).r) != kNoDepth;
+    const vec4 w = from == 0 ? imageLoad(winner_from_cur, q) : imageLoad(winner_from_prev, q);
+    s.v = w.xy;
+    s.distance = w.z;
+    s.solo = w.w > 1.5;
+    return s;
+}
+
+// How much the two frames disagree about surface s around uv (3x3 taps, display-encoded)
+float Disagreement(Surface s, vec2 uv) {
+    const vec4 at = Sources(s, uv);
+    const vec2 texel = 1.0 / p.out_size;
+    float c = 0.0;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            const vec2 o = vec2(dx, dy) * texel;
+            const vec3 d = texture(scene_prev, at.xy + o).rgb - texture(scene_cur, at.zw + o).rgb;
+            c += abs(d.r) + abs(d.g) + abs(d.b);
+        }
+    return c / 27.0;
+}
+
+void Store(ivec2 xy, Surface s, float code, bool confirmed) {
+    confirmed = confirmed || s.solo;  // clean mode's moving things are from one frame by design
+    imageStore(choice, xy, vec4(s.v, s.distance, code + (confirmed ? 0.0 : 8.0) + (s.solo ? 16.0 : 0.0)));
+    g_unconfirmed = !confirmed;
+}
+
+void pick(ivec2 xy) {
+    const vec2 uv = (vec2(xy) + 0.5) / p.out_size;
+
+    const Surface c = Load(xy, 0), q = Load(xy, 1);
+    if ((c.ok && c.solo) || (q.ok && q.solo)) {
+        // clean mode: the nearer frame, moved by the camera, wherever it landed
+        const Surface s = c.ok && c.solo ? c : q;
+        Store(xy, s, kOne + float(s.from), true);
+        return;
+    }
+    const float kConsistent = 0.06;
+    const bool same_distance = abs(c.distance - q.distance) <= 0.03 * min(c.distance, q.distance);
+    if (c.ok && q.ok && distance(c.v * p.out_size, -q.v * p.out_size) < 0.5 && same_distance) {
+        // both frames moved the same surface here the same way (most of the frame); confirmed by one tap of
+        // colour (the full 3x3 check costs too much on every pixel), since both warps can share a wrong motion
+        const vec4 at = Sources(c, uv);
+        const vec3 d = abs(texture(scene_prev, at.xy).rgb - texture(scene_cur, at.zw).rgb);
+        Store(xy, c, kBoth, d.r + d.g + d.b < 0.25);
+    } else if (c.ok && q.ok) {
+        const bool good_c = Disagreement(c, uv) < kConsistent, good_q = Disagreement(q, uv) < kConsistent;
+        if (good_c != good_q) {
+            const Surface s = good_c ? c : q;
+            Store(xy, s, kOne + float(s.from), true);
+        } else if (same_distance) {
+            Store(xy, c, kBoth, good_c);
+        } else {
+            // both consistent: the nearer occludes; neither: the frame nearer in time is the better guess
+            const Surface s = good_c ? (c.distance < q.distance ? c : q) : (p.t >= 0.5 ? c : q);
+            Store(xy, s, kOne + float(s.from), good_c);
+        }
+    } else if (c.ok || q.ok) {
+        // one surface: unconfirmed when the frames disagree about it. That is right for a thin strip being
+        // covered or uncovered, which never reaches the share that fades an area (zn_interp_compose); a wrongly
+        // moved character leaves whole areas like this.
+        const Surface s = c.ok ? c : q;
+        Store(xy, s, kOne + float(s.from), Disagreement(s, uv) < kConsistent);
+    } else {
+        Surface far;
+        far.ok = false;
+        far.from = 0;
+        far.v = vec2(0.0);
+        far.distance = -1.0;
+        far.solo = false;
+        for (int r = 1; r <= 4 && !far.ok; r++)
+            for (int dy = -r; dy <= r; dy++)
+                for (int dx = -r; dx <= r; dx++) {
+                    if (max(abs(dx), abs(dy)) != r) continue;
+                    const ivec2 n = clamp(xy + ivec2(dx, dy), ivec2(0), ivec2(p.out_size) - 1);
+                    for (int from = 0; from <= 1; from++) {
+                        const Surface s = Load(n, from);
+                        if (s.ok && s.distance > far.distance) far = s;
+                    }
+                }
+        Store(xy, far, far.ok ? kOne + float(far.from) + 4.0 : kNone, true);
+    }
+}
+
+void main() {
+    if (gl_LocalInvocationIndex == 0u) group_unconfirmed = 0u;
+    barrier();
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (all(lessThan(xy, ivec2(p.out_size)))) {
+        pick(xy);
+        if (g_unconfirmed) atomicAdd(group_unconfirmed, 1u);
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u && group_unconfirmed > 0u)
+        imageAtomicAdd(unconfirmed_total, ivec2(0), group_unconfirmed);
+}

@@ -1,0 +1,3 @@
+# Guest function hooks: ADDRESS NAME [replace|wrap] (see recomp/generate.py load_hooks).
+# Addresses are per game version (config/targets). Changing this file regenerates the affected units.
+

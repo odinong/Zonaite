@@ -1,0 +1,5 @@
+Eden emulator, https://github.com/eden-emulator/mirror
+commit 072da775164ab258f2bbe62eecf935a99e7f36f1
+parts: src/common, src/shader_recompiler, src/video_core, src/core, src/audio_core, src/hid_core, externals/stb, externals/bc_decoder, externals/FidelityFX-FSR
+skipped: src/common/android, src/common/apple, src/common/linux, src/core/debugger, src/shader_recompiler/backend/glasm, src/shader_recompiler/backend/glsl, src/video_core/renderer_opengl
+licence: GPL-3.0-or-later (see LICENSE.txt and the SPDX header in each file)
